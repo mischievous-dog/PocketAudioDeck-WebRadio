@@ -115,14 +115,13 @@ cable connector side with M2 x 6 mm self-tapping screws.
 
 ## Included Stations
 
-- Groove Salad
-- Drone Zone
-- Indie Pop Rocks!
-- Space Station Soma
+- Groove Salad (SomaFM)
+- Drone Zone (SomaFM)
+- Indie Pop Rocks! (SomaFM)
+- Space Station Soma (SomaFM)
+- COAST-FM 76.7MHz (JCBA SimulRadio / FM Numazu)
 
-The URLs are taken from SomaFM's official Non-SSL MP3 playlists. SomaFM is a
-listener-supported service; its availability and terms apply. Stream URLs may
-change, so verify them against [SomaFM's official listen page](https://somafm.com/listen/).
+The SomaFM URLs are taken from SomaFM's official playlists. COAST-FM streams via JCBA SimulRadio with dynamic token resolution. Availability and terms apply to each service.
 
 ## Wi-Fi Setup
 
@@ -143,13 +142,13 @@ Credentials are stored in ESP32 NVS.
 - Volume control left/right: volume down/up
 - Volume control push: toggle mute
 - KEY1 click in MP3 mode: play/pause
-- KEY1 click in Web Radio mode: turn the display off
+- KEY1 click in Web Radio/Radiko mode: turn the display off
 - KEY1 hold for 1 second in MP3 mode: switch and save the progress/spectrum view
 - KEY1 hold for 4 seconds in MP3 mode: restore the previous view and turn the display off
-- KEY1 hold for 2 seconds in Web Radio mode: enter/leave Wi-Fi setup
+- KEY1 hold for 2 seconds in Web Radio/Radiko mode: enter/leave Wi-Fi setup
 - KEY1 press while the display is off: wake the display without triggering another action
 - KEY2 click in MP3 mode: change repeat mode
-- KEY2 hold: switch radio/MP3 mode
+- KEY2 hold: switch mode (Web Radio -> Radiko -> MP3)
 - KEY1 + KEY2: cycle EQ preset
 
 ## Command-Line Alternative

@@ -3,20 +3,16 @@ from pathlib import Path
 Import("env")
 
 project_dir = Path(env.subst("$PROJECT_DIR"))
-audio_cpp = (
-    project_dir
-    / ".pio"
-    / "libdeps"
-    / env.subst("$PIOENV")
-    / "ESP32-audioI2S"
-    / "src"
-    / "Audio.cpp"
-)
+audio_cpp_candidates = [
+    project_dir / ".pio" / "libdeps" / env.subst("$PIOENV") / "ESP32-audioI2S" / "src" / "Audio.cpp",
+    project_dir / ".pio-core" / "libdeps" / env.subst("$PIOENV") / "ESP32-audioI2S" / "src" / "Audio.cpp",
+]
+audio_cpp = next((p for p in audio_cpp_candidates if p.exists()), audio_cpp_candidates[0])
 
 if not audio_cpp.exists():
     print(f"[patch_audio_i2s] waiting for library install: {audio_cpp}")
 else:
-    text = audio_cpp.read_text()
+    text = audio_cpp.read_text(encoding="utf-8")
     original = text
 
     if "pocket_audio_process_raw_samples" not in text:
@@ -29,7 +25,8 @@ else:
             "}\n"
             "\n"
             "extern void pocket_audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S);\n"
-            "extern void pocket_audio_process_raw_samples(int32_t* outBuff, int16_t validSamples);\n",
+            "extern void pocket_audio_process_raw_samples(int32_t* outBuff, int16_t validSamples);\n"
+            "extern const char* pocket_audio_get_radiko_token();\n",
             1,
         )
 
@@ -108,8 +105,48 @@ else:
             1,
         )
 
+    radiko_auth_patch = (
+        '    if (authLen > 0) {\n'
+        '        if (c_user.valid() && strcmp(c_user.get(), "-") == 0) {\n'
+        '            rqh.append("X-Radiko-AuthToken: ");\n'
+        '            rqh.append(c_pwd.get());\n'
+        '            rqh.append("\\r\\n");\n'
+        '        } else {\n'
+        '            rqh.append("Authorization: Basic ");\n'
+        '            rqh.append(authorization);\n'
+        '            rqh.append("\\r\\n");\n'
+        '        }\n'
+        '    }\n'
+    )
+    if "X-Radiko-AuthToken" not in text:
+        text = text.replace(
+            '    if (authLen > 0) {\n'
+            '        rqh.append("Authorization: Basic ");\n'
+            '        rqh.append(authorization);\n'
+            '        rqh.append("\\r\\n");\n'
+            '    }\n',
+            radiko_auth_patch,
+            1,
+        )
+
+    radiko_http_print_hook = (
+        '    const char* radikoTok = pocket_audio_get_radiko_token();\n'
+        '    if (radikoTok && radikoTok[0] != \'\\0\') {\n'
+        '        rqh.append("X-Radiko-AuthToken: ");\n'
+        '        rqh.append(radikoTok);\n'
+        '        rqh.append("\\r\\n");\n'
+        '    }\n'
+        '    rqh.append("Accept-Encoding: identity;q=1,*;q=0\\r\\n");\n'
+    )
+    if "pocket_audio_get_radiko_token()" not in text:
+        text = text.replace(
+            '    rqh.append("Accept-Encoding: identity;q=1,*;q=0\\r\\n");\n',
+            radiko_http_print_hook,
+            1,
+        )
+
     if text != original:
-        audio_cpp.write_text(text)
-        print("[patch_audio_i2s] patched PCM, SD hot-plug, and UTF-16 ID3 hooks")
+        audio_cpp.write_text(text, encoding="utf-8")
+        print("[patch_audio_i2s] patched PCM, SD hot-plug, UTF-16 ID3, and Radiko headers")
     else:
         print("[patch_audio_i2s] no changes needed")

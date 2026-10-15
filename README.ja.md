@@ -113,14 +113,14 @@ PlatformIO CoreやArduino IDEを別途インストールする必要はありま
 
 ## 収録放送局
 
-- Groove Salad
-- Drone Zone
-- Indie Pop Rocks!
-- Space Station Soma
+- Groove Salad (SomaFM)
+- Drone Zone (SomaFM)
+- Indie Pop Rocks! (SomaFM)
+- Space Station Soma (SomaFM)
+- COAST-FM 76.7MHz (JCBAサイマルラジオ / エフエムぬまづ)
 
-URLはSomaFM公式のNon-SSL MP3プレイリストに掲載されているものを使用しています。
-SomaFMはリスナー支援型サービスであり、利用可能性と利用条件は同サービスに従います。
-配信URLは変更される可能性があるため、[SomaFM公式Listenページ](https://somafm.com/listen/)も確認してください。
+URLはSomaFMおよびJCBA公式サイマル配信を利用しています。
+SomaFMはリスナー支援型サービス、JCBAは日本コミュニティ放送協会運営のサイマル配信であり、利用可能性と利用条件は各サービスに従います。
 
 ## Wi-Fi設定
 
@@ -141,13 +141,13 @@ SomaFMはリスナー支援型サービスであり、利用可能性と利用�
 - 音量コントロール左/右: 音量ダウン/アップ
 - 音量コントロール押し込み: ミュート切り替え
 - MP3モードでKEY1短押し: 再生/一時停止
-- WebラジオモードでKEY1短押し: 画面OFF
+- Webラジオ/RadikoモードでKEY1短押し: 画面OFF
 - MP3モードでKEY1を1秒長押し: 進捗バー/スペクトラム表示を切り替えて保存
 - MP3モードでKEY1を4秒長押し: 表示モードを元に戻して画面OFF
-- WebラジオモードでKEY1を2秒長押し: Wi-Fi設定画面の開始/終了
+- Webラジオ/RadikoモードでKEY1を2秒長押し: Wi-Fi設定画面の開始/終了
 - 画面OFF中にKEY1を押す: 他の操作をせず画面を復帰
 - MP3モードでKEY2短押し: リピートモード切り替え
-- KEY2長押し: ラジオ/MP3モード切り替え
+- KEY2長押し: Webラジオ／Radiko／MP3 モード切り替え（順次ローテーション）
 - KEY1 + KEY2: EQプリセット切り替え
 
 ## コマンドで書き込む場合
@@ -187,11 +187,14 @@ macOS/LinuxでPlatformIOがPATHにある場合は、既存の補助スクリプ�
 `src/main.cpp`の`kStations`へ項目を追加します。
 
 ```cpp
+// 通常のHTTP MP3ストリーム局の例
 {"Station Name", "http://example.com/live-128-mp3"},
+
+// JCBAサイマルラジオ局の例（URLの末尾IDを指定）
+{"COAST-FM 76.7MHz", "jcba:coastfm"},
 ```
 
-直接接続できるHTTP MP3ストリームURLを推奨します。
-プレイリストページ、HTTPS専用ストリーム、AAC、HLS、認証が必要なサービスには追加実装が必要な場合があります。
+JCBA局は `jcba:<ステーションID>` の形式で指定すると、選局時に動的にJCBA APIから最新の認証トークンとストリームURLを取得して自動接続します。
 
 ## ライセンス
 

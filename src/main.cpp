@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "welcome_logo.h"
+#include "radiko_client.h"
+#include "jcba_client.h"
 
 // Leave empty in source. Configure Wi-Fi from the on-device captive portal.
 static const char* WIFI_SSID = "";
@@ -62,11 +64,13 @@ static const WebRadioStation kStations[] = {
     {"Drone Zone", "http://ice2.somafm.com/dronezone-128-mp3"},
     {"Indie Pop Rocks!", "http://ice2.somafm.com/indiepop-128-mp3"},
     {"Space Station Soma", "http://ice2.somafm.com/spacestation-128-mp3"},
+    {"COAST-FM 76.7MHz", "jcba:coastfm"},
 };
 static constexpr size_t kStationCount = sizeof(kStations) / sizeof(kStations[0]);
 
 enum class AppMode : uint8_t {
   Radio,
+  Radiko,
   Mp3,
 };
 
@@ -124,6 +128,13 @@ struct DebouncedInput {
 
 static AppMode appMode = AppMode::Radio;
 static int pendingAppMode = -1;
+static size_t radikoStationIndex = 0;
+static uint32_t lastRadikoProgramUpdateMs = 0;
+static bool radikoProgramFetchPending = false;
+
+bool isRadikoPlaybackActive() {
+  return appMode == AppMode::Radiko;
+}
 static String wifiSsid;
 static String wifiPassword;
 static bool wifiConnectionFailed = false;
@@ -237,6 +248,10 @@ static const WebRadioStation& currentStation() {
 }
 
 static const char* currentStationName() {
+  if (appMode == AppMode::Radiko) {
+    const auto* st = RadikoClient::instance().getStation(radikoStationIndex);
+    return st ? st->name.c_str() : "Radiko";
+  }
   return currentStation().name;
 }
 
@@ -264,12 +279,18 @@ static bool playMp3Track(size_t index);
 static void switchAppMode(AppMode mode);
 static void saveCurrentStation();
 static bool tuneStation(size_t index);
+static void selectRadikoStationImmediately(size_t index);
+static bool tuneRadikoStation(size_t index);
 static bool connectWiFi();
 static void startWifiConfigPortal();
 static void serviceWifiConfigPortal();
 
 static void resetStationUiState() {
-  programTitle = "Waiting for stream title";
+  if (appMode == AppMode::Radio && strncmp(currentStation().url, "jcba:", 5) == 0) {
+    programTitle = "コミュニティFM サイマル放送";
+  } else {
+    programTitle = "Waiting for stream title";
+  }
   lastDrawnProgramTitle = "";
   uiNeedsFullRedraw = true;
   streamReadyShown = false;
@@ -288,7 +309,42 @@ static void selectStationImmediately(size_t index) {
   showStatus("Station selected");
 }
 
+static void selectRadikoStationImmediately(size_t index) {
+  auto& rc = RadikoClient::instance();
+  if (rc.getStationCount() == 0) {
+    return;
+  }
+  if (index >= rc.getStationCount()) {
+    index = 0;
+  }
+  radikoStationIndex = index;
+  saveCurrentStation();
+  resetStationUiState();
+  audio.stopSong();
+  Serial.printf("[Radiko] selected %u/%u %s\n", static_cast<unsigned>(radikoStationIndex + 1),
+                static_cast<unsigned>(rc.getStationCount()), currentStationName());
+  showStatus("Station selected");
+}
+
 static void requestTuneStation(size_t index) {
+  if (appMode == AppMode::Radiko) {
+    auto& rc = RadikoClient::instance();
+    if (rc.getStationCount() == 0) {
+      return;
+    }
+    if (index >= rc.getStationCount()) {
+      index = 0;
+    }
+    selectRadikoStationImmediately(index);
+    if (tuningBusy) {
+      pendingTuneIndex = static_cast<int>(index);
+      tuneAbortRequested = true;
+      return;
+    }
+    tuneRadikoStation(index);
+    return;
+  }
+
   if (index >= kStationCount) {
     return;
   }
@@ -302,11 +358,27 @@ static void requestTuneStation(size_t index) {
 }
 
 static void requestNextStation() {
-  requestTuneStation((stationIndex + 1) % kStationCount);
+  if (appMode == AppMode::Radiko) {
+    auto& rc = RadikoClient::instance();
+    const size_t count = rc.getStationCount();
+    if (count > 0) {
+      requestTuneStation((radikoStationIndex + 1) % count);
+    }
+  } else {
+    requestTuneStation((stationIndex + 1) % kStationCount);
+  }
 }
 
 static void requestPreviousStation() {
-  requestTuneStation((stationIndex + kStationCount - 1) % kStationCount);
+  if (appMode == AppMode::Radiko) {
+    auto& rc = RadikoClient::instance();
+    const size_t count = rc.getStationCount();
+    if (count > 0) {
+      requestTuneStation((radikoStationIndex + count - 1) % count);
+    }
+  } else {
+    requestTuneStation((stationIndex + kStationCount - 1) % kStationCount);
+  }
 }
 
 static bool pollUserControlsDuringTuning() {
@@ -449,6 +521,7 @@ static const char* uiStatusLabel() {
 static void loadSavedStation() {
   preferences.begin("pocket-audio", true);
   const uint8_t saved = preferences.getUChar("station", 0);
+  const uint8_t savedRadiko = preferences.getUChar("radiko_stn", 0);
   const uint8_t savedVolume = preferences.getUChar("volume", kDefaultVolume);
   const uint8_t savedMode =
       preferences.getUChar("mode", static_cast<uint8_t>(AppMode::Radio));
@@ -465,6 +538,7 @@ static void loadSavedStation() {
   if (saved < kStationCount) {
     stationIndex = saved;
   }
+  radikoStationIndex = savedRadiko;
   if (savedMode <= static_cast<uint8_t>(AppMode::Mp3)) {
     appMode = static_cast<AppMode>(savedMode);
   }
@@ -490,15 +564,21 @@ static void loadSavedStation() {
   Serial.printf("[MP3] boot loop=%s track=%s\n",
                 loopNames[static_cast<uint8_t>(mp3LoopMode)],
                 savedMp3TrackPath.isEmpty() ? "<first>" : savedMp3TrackPath.c_str());
-  Serial.printf("[Mode] boot %s\n", appMode == AppMode::Mp3 ? "MP3" : "RADIO");
+  Serial.printf("[Mode] boot %s\n", appMode == AppMode::Mp3 ? "MP3"
+                                  : (appMode == AppMode::Radiko ? "RADIKO" : "RADIO"));
   Serial.printf("[WiFi] configured SSID '%s'\n", wifiSsid.c_str());
 }
 
 static void saveCurrentStation() {
   preferences.begin("pocket-audio", false);
-  preferences.putUChar("station", static_cast<uint8_t>(stationIndex));
+  if (appMode == AppMode::Radiko) {
+    preferences.putUChar("radiko_stn", static_cast<uint8_t>(radikoStationIndex));
+  } else {
+    preferences.putUChar("station", static_cast<uint8_t>(stationIndex));
+  }
   preferences.end();
-  Serial.printf("[Station] saved %u %s\n", static_cast<unsigned>(stationIndex),
+  Serial.printf("[Station] saved %u %s\n",
+                static_cast<unsigned>(appMode == AppMode::Radiko ? radikoStationIndex : stationIndex),
                 currentStationName());
 }
 
@@ -506,7 +586,8 @@ static void saveAppMode() {
   preferences.begin("pocket-audio", false);
   preferences.putUChar("mode", static_cast<uint8_t>(appMode));
   preferences.end();
-  Serial.printf("[Mode] saved %s\n", appMode == AppMode::Mp3 ? "MP3" : "RADIO");
+  Serial.printf("[Mode] saved %s\n", appMode == AppMode::Mp3 ? "MP3"
+                                  : (appMode == AppMode::Radiko ? "RADIKO" : "RADIO"));
 }
 
 static void maybeSaveVolume() {
@@ -691,6 +772,14 @@ static void drawRadioPlayerInfo() {
 
   topCanvas.setFont(&fonts::lgfxJapanGothicP_20);
   topCanvas.setCursor(2, 6);
+  if (appMode == AppMode::Radiko) {
+    auto& rc = RadikoClient::instance();
+    if (rc.getStationCount() > 0) {
+      char numBuf[16];
+      snprintf(numBuf, sizeof(numBuf), "%02u: ", static_cast<unsigned>(radikoStationIndex + 1));
+      topCanvas.print(numBuf);
+    }
+  }
   topCanvas.print(currentStationName());
 
   drawScrollingText(topCanvas, programTitle, 2, 36, w - 4, topH - 37,
@@ -1723,6 +1812,17 @@ static void switchAppMode(AppMode mode) {
     return;
   }
 
+  if (mode == AppMode::Radiko) {
+    Serial.println("[Mode] RADIKO");
+    currentStatus = "Radiko selected";
+    renderUi();
+    if (WiFi.status() != WL_CONNECTED && !connectWiFi()) {
+      return;
+    }
+    tuneRadikoStation(radikoStationIndex);
+    return;
+  }
+
   Serial.println("[Mode] RADIO");
   currentStatus = "Station selected";
   renderUi();
@@ -1774,7 +1874,7 @@ static void handleMediaKey(uint32_t now) {
   Serial.printf("[Input] %s adc=%d\n",
                 mediaKeyStable == MediaKey::Next ? "SW1 next" : "SW2 previous",
                 analogRead(MEDIA_KEY_ADC));
-  if (appMode == AppMode::Radio) {
+  if (appMode == AppMode::Radio || appMode == AppMode::Radiko) {
     if (mediaKeyStable == MediaKey::Previous) {
       requestPreviousStation();
     } else {
@@ -1864,7 +1964,7 @@ static void handleM5Keys() {
     toggleMp3LowerView(true);
   }
 
-  if (appMode == AppMode::Radio && !key1LongActionTriggered &&
+  if (appMode != AppMode::Mp3 && !key1LongActionTriggered &&
       M5.BtnA.pressedFor(kRadioSetupHoldMs)) {
     key1LongActionTriggered = true;
     if (wifiConfigPortalActive) {
@@ -1889,23 +1989,21 @@ static void handleM5Keys() {
   const bool key1Clicked = M5.BtnA.wasReleased() && !key1LongActionTriggered;
 
   if (M5.BtnB.wasHold()) {
-    const AppMode next = appMode == AppMode::Radio ? AppMode::Mp3 : AppMode::Radio;
+    const AppMode next = appMode == AppMode::Radio ? AppMode::Radiko
+                       : (appMode == AppMode::Radiko ? AppMode::Mp3 : AppMode::Radio);
     pendingAppMode = static_cast<int>(next);
   } else if (M5.BtnB.wasClicked() && appMode == AppMode::Mp3) {
     cycleMp3LoopMode();
   }
 
-  if (appMode == AppMode::Radio) {
+  if (appMode != AppMode::Mp3) {
     if (key1Clicked) {
-      Serial.println("[Input] KEY1 WebRadio display off");
+      Serial.println("[Input] KEY1 Radio/Radiko display off");
       sleepDisplay();
     }
     return;
   }
 
-  if (appMode != AppMode::Mp3) {
-    return;
-  }
   if (key1Clicked) {
     toggleMp3Pause();
   }
@@ -1942,6 +2040,31 @@ static bool tuneStation(size_t index) {
 
   if (stationIndex != index) {
     selectStationImmediately(index);
+  }
+
+  tuningBusy = true;
+  tuneAbortRequested = false;
+  pendingTuneIndex = -1;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    tuningBusy = false;
+    return false;
+  }
+  const bool ok = playStream();
+  tuningBusy = false;
+  return ok;
+}
+
+static bool tuneRadikoStation(size_t index) {
+  auto& rc = RadikoClient::instance();
+  if (rc.getStationCount() == 0) {
+    return false;
+  }
+  if (index >= rc.getStationCount()) {
+    index = 0;
+  }
+  if (radikoStationIndex != index) {
+    selectRadikoStationImmediately(index);
   }
 
   tuningBusy = true;
@@ -2192,14 +2315,56 @@ static bool connectWiFi() {
 }
 
 static bool playStream() {
-  const char* url = activeStreamUrl();
-  if (!url) {
-    Serial.println("[Stream] no stream URL resolved");
-    showStatus("No stream URL");
-    return false;
+  String resolvedUrl;
+  const char* radikoToken = nullptr;
+
+  if (appMode == AppMode::Radiko) {
+    auto& rc = RadikoClient::instance();
+    if (!rc.isAuthenticated()) {
+      showStatus("Radiko Auth");
+      Serial.println("[Radiko] Authenticating...");
+      if (!rc.authenticate()) {
+        Serial.println("[Radiko] Authentication failed");
+        showStatus("Auth Failed");
+        return false;
+      }
+    }
+    const auto* st = rc.getStation(radikoStationIndex);
+    if (!st) {
+      showStatus("No station");
+      return false;
+    }
+    resolvedUrl = rc.getStreamUrl(st->id);
+    radikoToken = rc.getAuthToken().c_str();
+
+    programTitle = "番組名を取得中...";
+    lastDrawnProgramTitle = "";
+    radikoProgramFetchPending = true;
+  } else {
+    const char* url = activeStreamUrl();
+    if (!url) {
+      Serial.println("[Stream] no stream URL resolved");
+      showStatus("No stream URL");
+      return false;
+    }
+    if (strncmp(url, "jcba:", 5) == 0) {
+      showStatus("JCBA Connect");
+      const char* stationId = url + 5;
+      resolvedUrl = JcbaClient::resolveStreamUrl(stationId);
+      if (resolvedUrl.isEmpty()) {
+        Serial.println("[JCBA] Failed to resolve stream URL");
+        showStatus("JCBA Failed");
+        return false;
+      }
+      programTitle = "コミュニティFM サイマル放送";
+      lastDrawnProgramTitle = "";
+    } else {
+      resolvedUrl = url;
+    }
   }
+
   showStatus("Stream connecting");
-  Serial.printf("[Stream] connecting: %s\n", url);
+  Serial.printf("[Stream] connecting: %s\n", resolvedUrl.c_str());
 
   streamReadyShown = false;
   resetAudioVisualization();
@@ -2215,12 +2380,20 @@ static bool playStream() {
 
   audio.setVolume(volumeLevel);
   updateAudioOutputGate(true);
-  audio.setConnectionTimeout(3000, 3000);
+  audio.setConnectionTimeout(4000, 4000);
   if (tuningBusy && pollUserControlsDuringTuning()) {
     Serial.println("[Stream] aborted before connecttohost");
     return false;
   }
-  if (!audio.connecttohost(url)) {
+
+  bool connectOk = false;
+  if (radikoToken && radikoToken[0] != '\0') {
+    connectOk = audio.connecttohost(resolvedUrl.c_str(), "-", radikoToken);
+  } else {
+    connectOk = audio.connecttohost(resolvedUrl.c_str());
+  }
+
+  if (!connectOk) {
     if (tuneAbortRequested) {
       Serial.println("[Stream] connecttohost aborted by user");
       return false;
@@ -2248,22 +2421,23 @@ static void handleSerialCommand() {
     } else if (c == 'v' || c == 'V') {
       adjustVolume(1);
     } else if (c == 'n' || c == 'N') {
-      if (appMode == AppMode::Radio) {
+      if (appMode == AppMode::Radio || appMode == AppMode::Radiko) {
         tuneNextStation();
       } else {
         playNextMp3(true);
       }
     } else if (c == 'm' || c == 'M') {
-      if (appMode == AppMode::Radio) {
+      if (appMode == AppMode::Radio || appMode == AppMode::Radiko) {
         tunePreviousStation();
       } else {
         playPreviousMp3();
       }
     } else if (c == 'o' || c == 'O') {
-      pendingAppMode = static_cast<int>(appMode == AppMode::Radio ? AppMode::Mp3
-                                                                 : AppMode::Radio);
+      const AppMode next = appMode == AppMode::Radio ? AppMode::Radiko
+                         : (appMode == AppMode::Radiko ? AppMode::Mp3 : AppMode::Radio);
+      pendingAppMode = static_cast<int>(next);
     } else if (c == 'w' || c == 'W') {
-      if (appMode == AppMode::Radio) {
+      if (appMode != AppMode::Mp3) {
         if (wifiConfigPortalActive) {
           Serial.println("[Input] UART exit WiFi setup");
           wifiConfigPortalExitRequested = true;
@@ -2329,7 +2503,7 @@ void audioInfo(Audio::msg_t msg) {
     }
     return;
   }
-  if (appMode == AppMode::Radio && msg.e == Audio::evt_streamtitle && msg.msg) {
+  if ((appMode == AppMode::Radio || appMode == AppMode::Radiko) && msg.e == Audio::evt_streamtitle && msg.msg) {
     String title(msg.msg);
     title.trim();
     if (!title.isEmpty()) {
@@ -2337,10 +2511,10 @@ void audioInfo(Audio::msg_t msg) {
       lastDrawnProgramTitle = "";
       titleScrollStartMs = millis();
       uiNeedsFullRedraw = true;
-      Serial.printf("[Radio] title=%s\n", programTitle.c_str());
+      Serial.printf("[Stream] title=%s\n", programTitle.c_str());
     }
   }
-  if (appMode == AppMode::Radio && !streamReadyShown && msg.msg) {
+  if ((appMode == AppMode::Radio || appMode == AppMode::Radiko) && !streamReadyShown && msg.msg) {
     const String text(msg.msg);
     if (text.indexOf("stream ready") >= 0) {
       streamReadyShown = true;
@@ -2541,7 +2715,11 @@ void setup() {
     return;
   }
 
-  playStream();
+  if (appMode == AppMode::Radiko) {
+    tuneRadikoStation(radikoStationIndex);
+  } else {
+    playStream();
+  }
 }
 
 void loop() {
@@ -2556,7 +2734,7 @@ void loop() {
     delay(1);
     return;
   }
-  if (!tuningBusy && wifiConfigPortalRequested && appMode == AppMode::Radio) {
+  if (!tuningBusy && wifiConfigPortalRequested && appMode != AppMode::Mp3) {
     startWifiConfigPortal();
     return;
   }
@@ -2569,7 +2747,11 @@ void loop() {
   if (!tuningBusy && pendingTuneIndex >= 0) {
     const int index = pendingTuneIndex;
     pendingTuneIndex = -1;
-    tuneStation(static_cast<size_t>(index));
+    if (appMode == AppMode::Radiko) {
+      tuneRadikoStation(static_cast<size_t>(index));
+    } else {
+      tuneStation(static_cast<size_t>(index));
+    }
     return;
   }
   handleSerialCommand();
@@ -2577,14 +2759,29 @@ void loop() {
   audio.loop();
   processMp3AudioEvents();
   reportPcmActivity();
-  if (appMode == AppMode::Radio && playbackSamplesSeen &&
+  if (appMode == AppMode::Radiko &&
+      (radikoProgramFetchPending || millis() - lastRadikoProgramUpdateMs > 120000UL)) {
+    radikoProgramFetchPending = false;
+    lastRadikoProgramUpdateMs = millis();
+    auto& rc = RadikoClient::instance();
+    const auto* st = rc.getStation(radikoStationIndex);
+    if (st) {
+      String title = rc.fetchNowProgramTitle(st->id);
+      if (!title.isEmpty()) {
+        programTitle = title;
+        lastDrawnProgramTitle = "";
+        Serial.printf("[Radiko] title=%s\n", programTitle.c_str());
+      }
+    }
+  }
+  if ((appMode == AppMode::Radio || appMode == AppMode::Radiko) && playbackSamplesSeen &&
       currentStatus == "Stream opened") {
     showStatus("Playing");
   }
   updateAudioOutputGate();
   renderUi();
 
-  if (appMode == AppMode::Radio && WiFi.status() != WL_CONNECTED &&
+  if ((appMode == AppMode::Radio || appMode == AppMode::Radiko) && WiFi.status() != WL_CONNECTED &&
       !wifiConnectionFailed) {
     Serial.println("[WiFi] disconnected");
     wifiConnectionFailed = true;
